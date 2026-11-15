@@ -1,0 +1,5 @@
+﻿research_data/
+__pycache__/
+*.pyc
+*.db
+.vscode/
