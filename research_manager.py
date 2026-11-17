@@ -52,6 +52,36 @@ def ensure_column(conn, table, column, col_def):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
 
 
+BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def beijing_now():
+    return datetime.datetime.now(BEIJING_TZ)
+
+
+def now_iso():
+    return beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str():
+    return beijing_now().strftime("%Y-%m-%d")
+
+
+def auto_rollover_tasks(conn, target_date=None):
+    """自动将过去日期未完成的任务顺延到今天（直到完成为止）"""
+    target = target_date or today_str()
+    cur = conn.execute(
+        """
+        UPDATE daily_tasks
+        SET origin_date = CASE WHEN COALESCE(origin_date, '') = '' THEN task_date ELSE origin_date END,
+            task_date = ?
+        WHERE is_completed = 0 AND task_date < ?
+        """,
+        (target, target),
+    )
+    return cur.rowcount
+
+
 def init_db():
     ensure_dirs()
     with get_conn() as conn:
@@ -81,6 +111,7 @@ def init_db():
                 status TEXT DEFAULT 'todo',
                 progress INTEGER DEFAULT 0,
                 due_date TEXT DEFAULT '',
+                priority TEXT DEFAULT 'medium',
                 subtasks_json TEXT DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -105,6 +136,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS daily_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_date TEXT NOT NULL,
+                origin_date TEXT DEFAULT '',
+                due_date TEXT DEFAULT '',
                 project_id INTEGER,
                 title TEXT NOT NULL,
                 priority TEXT DEFAULT 'medium',
@@ -133,18 +166,13 @@ def init_db():
             );
             """
         )
-        # 兼容旧版数据库平滑迁移
         ensure_column(conn, "project_steps", "subtasks_json", "TEXT DEFAULT '[]'")
+        ensure_column(conn, "project_steps", "priority", "TEXT DEFAULT 'medium'")
         ensure_column(conn, "daily_tasks", "subtasks_json", "TEXT DEFAULT '[]'")
+        ensure_column(conn, "daily_tasks", "origin_date", "TEXT DEFAULT ''")
+        ensure_column(conn, "daily_tasks", "due_date", "TEXT DEFAULT ''")
+        auto_rollover_tasks(conn, today_str())
         conn.commit()
-
-
-def now_iso():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def today_str():
-    return datetime.date.today().strftime("%Y-%m-%d")
 
 
 def parse_subtasks(raw):
@@ -196,7 +224,9 @@ def fetch_all_projects_summary():
 
     steps_by_proj = {}
     for s in step_rows:
-        steps_by_proj.setdefault(s["project_id"], []).append(dict(s))
+        sd = dict(s)
+        sd["subtasks"] = parse_subtasks(sd.get("subtasks_json"))
+        steps_by_proj.setdefault(s["project_id"], []).append(sd)
 
     ev_map = {r["project_id"]: r["cnt"] for r in ev_counts}
     result = []
@@ -207,8 +237,149 @@ def fetch_all_projects_summary():
         d["step_count"] = len(p_steps)
         d["done_step_count"] = sum(1 for s in p_steps if s["status"] == "done")
         d["evidence_count"] = ev_map.get(p["id"], 0)
+
+        # #3 只显示最新的未完成工作（当前最靠前的未完成步骤及其最新未完成分点）
+        pending_steps = [s for s in p_steps if s["status"] != "done"]
+        if pending_steps:
+            cur_step = pending_steps[0]
+            pending_subs = [sub["text"] for sub in cur_step["subtasks"] if not sub["done"]]
+            d["latest_unfinished"] = {
+                "step_id": cur_step["id"],
+                "step_order": cur_step["step_order"],
+                "step_title": cur_step["title"],
+                "step_progress": cur_step["progress"],
+                "due_date": cur_step["due_date"],
+                "pending_subtasks": pending_subs[:3],
+                "pending_subtask_total": len(pending_subs),
+            }
+        else:
+            d["latest_unfinished"] = None
+
         result.append(d)
     return result
+
+
+def fetch_urgent_quadrant():
+    """#5 按照截止时间推送最着急的5个任务或3天内必须完成的任务，并按紧急×重要四象限分类"""
+    today = beijing_now().date()
+    with get_conn() as conn:
+        if auto_rollover_tasks(conn, today_str()) > 0:
+            conn.commit()
+        steps = conn.execute(
+            """
+            SELECT ps.*, p.title AS project_title, p.status AS project_status, p.target_date AS project_target_date
+            FROM project_steps ps
+            JOIN projects p ON ps.project_id = p.id
+            WHERE ps.status != 'done' AND p.status != 'completed'
+            """
+        ).fetchall()
+        tasks = conn.execute(
+            """
+            SELECT dt.*, p.title AS project_title
+            FROM daily_tasks dt
+            LEFT JOIN projects p ON dt.project_id = p.id
+            WHERE dt.is_completed = 0
+            """
+        ).fetchall()
+
+    candidates = []
+
+    def calc_days_left(date_str):
+        if not date_str:
+            return None
+        try:
+            dt = datetime.date.fromisoformat(date_str[:10])
+            return (dt - today).days
+        except Exception:
+            return None
+
+    for s in steps:
+        due = s["due_date"] or s["project_target_date"] or ""
+        days_left = calc_days_left(due)
+        prio = s["priority"] or ("high" if s["project_status"] == "active" else "medium")
+        subs = parse_subtasks(s["subtasks_json"])
+        pending_subs = [x["text"] for x in subs if not x["done"]]
+        candidates.append(
+            {
+                "kind": "step",
+                "id": s["id"],
+                "project_id": s["project_id"],
+                "project_title": s["project_title"],
+                "title": f"步骤 {s['step_order']}：{s['title']}",
+                "sub_info": f"未完成分点：{pending_subs[0]}" if pending_subs else s["description"],
+                "due_date": due,
+                "days_left": days_left,
+                "priority": prio,
+                "important": prio == "high" or s["project_status"] == "active",
+            }
+        )
+
+    for t in tasks:
+        due = t["due_date"] or t["task_date"] or ""
+        days_left = calc_days_left(due)
+        prio = t["priority"] or "medium"
+        subs = parse_subtasks(t["subtasks_json"])
+        pending_subs = [x["text"] for x in subs if not x["done"]]
+        candidates.append(
+            {
+                "kind": "task",
+                "id": t["id"],
+                "project_id": t["project_id"],
+                "project_title": t["project_title"] or "日常科研",
+                "title": t["title"],
+                "sub_info": f"未完成分点：{pending_subs[0]}" if pending_subs else t["notes"],
+                "due_date": due,
+                "days_left": days_left,
+                "priority": prio,
+                "important": prio == "high",
+            }
+        )
+
+    # 排序规则：有截止时间的排前面（剩余天数越小越靠前），同天数高优先级靠前
+    candidates.sort(
+        key=lambda x: (
+            1 if x["days_left"] is None else 0,
+            x["days_left"] if x["days_left"] is not None else 99999,
+            0 if x["priority"] == "high" else (1 if x["priority"] == "medium" else 2),
+        )
+    )
+
+    # 推送集合：所有3天内必须完成的任务（days_left <= 3） + 补足最着急的前5个任务
+    urgent_3d = [c for c in candidates if c["days_left"] is not None and c["days_left"] <= 3]
+    top_5 = candidates[:5]
+    seen = set()
+    pushed = []
+    for item in urgent_3d + top_5:
+        key = (item["kind"], item["id"])
+        if key not in seen:
+            seen.add(key)
+            pushed.append(item)
+
+    # 四象限分配（对所有未完成待办/推送任务进行四象限分布）
+    quadrants = {
+        "q1_urgent_important": [],     # 重要且紧急（立即处理）
+        "q2_not_urgent_important": [], # 重要不紧急（重点规划）
+        "q3_urgent_not_important": [], # 紧急不重要（快速清理）
+        "q4_neither": [],              # 不重要不紧急（排期延后）
+    }
+    for item in candidates:
+        is_urgent = item["days_left"] is not None and item["days_left"] <= 3
+        is_important = bool(item["important"])
+        if is_urgent and is_important:
+            quadrants["q1_urgent_important"].append(item)
+        elif not is_urgent and is_important:
+            quadrants["q2_not_urgent_important"].append(item)
+        elif is_urgent and not is_important:
+            quadrants["q3_urgent_not_important"].append(item)
+        else:
+            quadrants["q4_neither"].append(item)
+
+    return {
+        "today": today_str(),
+        "pushed_top": pushed,
+        "urgent_3d_count": len(urgent_3d),
+        "quadrants": quadrants,
+    }
 
 
 def fetch_project_detail(project_id):
@@ -254,7 +425,10 @@ def sanitize_filename(name):
 
 def seed_sample_data():
     ts = now_iso()
-    today = today_str()
+    today = beijing_now().date()
+    today_s = today.strftime("%Y-%m-%d")
+    in_2_days = (today + datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+    in_10_days = (today + datetime.timedelta(days=10)).strftime("%Y-%m-%d")
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -286,6 +460,7 @@ def seed_sample_data():
                 "done",
                 100,
                 "2026-09-20",
+                "medium",
                 [{"text": "完成点云航带拼接与去噪", "done": True}, {"text": "完成POS与影像时间戳对齐", "done": True}],
             ),
             (
@@ -295,6 +470,7 @@ def seed_sample_data():
                 "done",
                 100,
                 "2026-10-18",
+                "medium",
                 [{"text": "实现Z-buffer遮挡检测", "done": True}, {"text": "实现多视角加权聚合", "done": True}],
             ),
             (
@@ -303,31 +479,33 @@ def seed_sample_data():
                 "在7个样地航飞块上运行消融实验与基线对比。",
                 "in_progress",
                 67,
-                "2026-11-25",
+                in_2_days,
+                "high",
                 [
                     {"text": "完成样地1-5基线对比", "done": True},
                     {"text": "完成样地6-7消融实验", "done": True},
-                    {"text": "汇总PSNR与ΔE2000统计表", "done": False},
+                    {"text": "汇总峰值信噪比与色差统计表", "done": False},
                 ],
             ),
             (
                 4,
                 "论文撰写与图表规范化排版",
-                "按 ISPRS 期刊要求绘制 180mm 宽图件并完成 LaTeX 初稿。",
+                "按期刊要求绘制 180 毫米宽图件并完成排版初稿。",
                 "todo",
                 0,
-                "2026-12-20",
+                in_10_days,
+                "medium",
                 [],
             ),
         ]
         step_ids = []
-        for order, title, desc, st, prog, due, subs in steps_p1:
+        for order, title, desc, st, prog, due, prio, subs in steps_p1:
             cur.execute(
                 """
-                INSERT INTO project_steps (project_id, step_order, title, description, status, progress, due_date, subtasks_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO project_steps (project_id, step_order, title, description, status, progress, due_date, priority, subtasks_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (p1_id, order, title, desc, st, prog, due, json.dumps(subs, ensure_ascii=False), ts),
+                (p1_id, order, title, desc, st, prog, due, prio, json.dumps(subs, ensure_ascii=False), ts),
             )
             step_ids.append(cur.lastrowid)
 
@@ -342,22 +520,7 @@ def seed_sample_data():
                 "外业样地与航飞数据清单",
                 "data_note",
                 "",
-                "共整理 7 个核心样地-航飞单元：累计 261.1M LiDAR 点，466 张高分辨率 RGB 影像；补充采集 298.6M 点 / 507 帧混交林数据。",
-                ts,
-            ),
-        )
-        cur.execute(
-            """
-            INSERT INTO step_evidences (step_id, project_id, title, evidence_type, local_path, data_summary, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                step_ids[2],
-                p1_id,
-                "留一视角评估指标初版汇总",
-                "data_note",
-                "",
-                "PSNR 较最近视角基线提升 +2.4 dB，跨视角色差 ΔE2000 下降 31.5%（待补充第 6、7 航飞块最终统计）。",
+                "共整理 7 个核心样地-航飞单元：累计 2.61 亿激光雷达点，466 张高分辨率影像；补充采集 2.98 亿点 / 507 帧混交林数据。",
                 ts,
             ),
         )
@@ -384,8 +547,8 @@ def seed_sample_data():
         p2_id = cur.lastrowid
         cur.execute(
             """
-            INSERT INTO project_steps (project_id, step_order, title, description, status, progress, due_date, subtasks_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO project_steps (project_id, step_order, title, description, status, progress, due_date, priority, subtasks_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 p2_id,
@@ -394,28 +557,31 @@ def seed_sample_data():
                 "完成组织管理、保障措施、知识产权与风险分析章节。",
                 "in_progress",
                 80,
-                "2026-11-20",
-                json.dumps([], ensure_ascii=False),
+                in_2_days,
+                "high",
+                json.dumps([{"text": "核对两年期季度甘特图节点", "done": False}], ensure_ascii=False),
                 ts,
             ),
         )
 
         cur.execute(
             """
-            INSERT INTO daily_tasks (task_date, project_id, title, priority, estimated_hours, notes, subtasks_json, is_completed, completed_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_tasks (task_date, origin_date, due_date, project_id, title, priority, estimated_hours, notes, subtasks_json, is_completed, completed_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                today,
+                today_s,
+                today_s,
+                today_s,
                 p1_id,
                 "整理第 6、7 航飞块跨视角色差统计表",
                 "high",
                 2.0,
-                "输出 CSV 并核对异常值",
+                "输出表格并核对异常值",
                 json.dumps(
                     [
-                        {"text": "导出第6航飞块CSV", "done": True},
-                        {"text": "导出第7航飞块CSV", "done": False},
+                        {"text": "导出第6航飞块数据表", "done": True},
+                        {"text": "导出第7航飞块数据表", "done": False},
                         {"text": "核对异常值并生成对比图", "done": False},
                     ],
                     ensure_ascii=False,
@@ -427,17 +593,17 @@ def seed_sample_data():
         )
         cur.execute(
             """
-            INSERT INTO daily_tasks (task_date, project_id, title, priority, estimated_hours, notes, subtasks_json, is_completed, completed_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_tasks (task_date, origin_date, due_date, project_id, title, priority, estimated_hours, notes, subtasks_json, is_completed, completed_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (today, p2_id, "核对两年期季度甘特图配色与节点文字", "medium", 1.0, "确保与申报书文本完全一致", "[]", 1, ts, ts),
+            (today_s, today_s, today_s, p2_id, "核对两年期季度甘特图配色与节点文字", "medium", 1.0, "确保与申报书文本完全一致", "[]", 1, ts, ts),
         )
         cur.execute(
             """
-            INSERT INTO daily_tasks (task_date, project_id, title, priority, estimated_hours, notes, subtasks_json, is_completed, completed_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_tasks (task_date, origin_date, due_date, project_id, title, priority, estimated_hours, notes, subtasks_json, is_completed, completed_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (today, None, "跟踪 3D Gaussian Splatting 林业重建本周新论文", "low", 0.5, "重点关注遮挡处理与点云融合方向", "[]", 0, "", ts),
+            (today_s, today_s, in_2_days, None, "跟踪三维高斯泼溅林业重建本周新论文", "low", 0.5, "重点关注遮挡处理与点云融合方向", "[]", 0, "", ts),
         )
         conn.commit()
 
@@ -716,6 +882,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 12px;
   }
 
+  /* Latest unfinished pill in dashboard */
+  .unfinished-pill {
+    margin-top: 8px;
+    padding: 7px 10px;
+    border-radius: 7px;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    font-size: 12.5px;
+    color: #92400e;
+  }
+
+  /* Quadrant Matrix */
+  .quad-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+  }
+  .quad-box {
+    border-radius: 10px;
+    padding: 14px;
+    border: 1px solid var(--border);
+    background: #ffffff;
+    min-height: 170px;
+  }
+  .quad-q1 { border-top: 4px solid #ef4444; background: #fffafa; }
+  .quad-q2 { border-top: 4px solid #2563eb; background: #f8fbff; }
+  .quad-q3 { border-top: 4px solid #f59e0b; background: #fffdf5; }
+  .quad-q4 { border-top: 4px solid #94a3b8; background: #f8fafc; }
+  .quad-item {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: #ffffff;
+    margin-top: 8px;
+    font-size: 12.5px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+  }
+  .quad-item:hover { border-color: var(--primary); }
+
   /* Projects Split Layout */
   .proj-layout {
     display: grid;
@@ -812,6 +1018,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     text-decoration: line-through;
     color: var(--muted);
   }
+  .task-item.highlight {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(37,99,235,0.18);
+  }
   .task-check {
     width: 18px;
     height: 18px;
@@ -894,7 +1104,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .toast.show { opacity: 1; }
   @media (max-width: 960px) {
-    .grid-4, .grid-2, .proj-layout { grid-template-columns: 1fr; }
+    .grid-4, .grid-2, .quad-grid, .proj-layout { grid-template-columns: 1fr; }
     .sidebar { width: 200px; }
   }
 </style>
@@ -904,10 +1114,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <aside class="sidebar">
   <div class="brand">
     <h1>科研项目工作台</h1>
-    <p>Windows 本地科研管理与证据库</p>
+    <p>本地科研管理与证据库</p>
   </div>
   <nav class="nav">
     <button class="nav-btn active" data-tab="dashboard" onclick="switchTab('dashboard')"><span>📊 全部项目总览</span></button>
+    <button class="nav-btn" data-tab="quadrant" onclick="switchTab('quadrant')">
+      <span>🎯 紧急四象限</span>
+      <span class="nav-badge" id="q-urgent-badge" style="display:none;">0</span>
+    </button>
     <button class="nav-btn" data-tab="projects" onclick="switchTab('projects')"><span>🔬 科研项目详情</span></button>
     <button class="nav-btn" data-tab="daily" onclick="switchTab('daily')"><span>✅ 每日工作记录</span></button>
     <button class="nav-btn" data-tab="feedback" onclick="switchTab('feedback')">
@@ -917,7 +1131,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </nav>
   <div class="sidebar-footer">
     <button onclick="seedDemo()">✨ 导入示例科研项目</button>
-    <button onclick="exportBackup()">💾 导出全库 JSON 备份</button>
+    <button onclick="exportBackup()">💾 导出全库备份</button>
     <button onclick="openDataFolder()">📂 打开本地数据目录</button>
   </div>
 </aside>
@@ -940,14 +1154,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 
 <script>
+function localTodayStr() {
+  const now = new Date();
+  const d = new Date(now.getTime() + (now.getTimezoneOffset() + 480) * 60000);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 let state = {
   tab: 'dashboard',
   projects: [],
   selectedProjectId: null,
   selectedProjectDetail: null,
-  selectedDate: new Date().toISOString().slice(0, 10),
+  selectedDate: localTodayStr(),
   dailyTasks: [],
   feedbacks: [],
+  quadrantData: null,
+  highlightTaskId: null,
   filterStatus: 'all',
   fbFilterStatus: 'all',
   fbFilterType: 'all',
@@ -988,7 +1213,7 @@ const FB_STATUS_MAP = {
   wontfix: { label: '暂不处理', cls: 'badge-low' }
 };
 
-const FB_MODULES = ['全部项目总览', '科研项目详情', '数据与证据', '每日工作记录', '界面与交互', '导出与备份', '其他'];
+const FB_MODULES = ['全部项目总览', '科研项目详情', '数据与证据', '每日工作记录', '紧急四象限', '界面与交互', '导出与备份', '其他'];
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1011,6 +1236,14 @@ async function api(url, method = 'GET', body = null) {
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || '请求失败');
   return data;
+}
+
+function formatDaysLeft(days) {
+  if (days === null || days === undefined) return '<span class="badge badge-plan">未设截止</span>';
+  if (days < 0) return `<span class="badge badge-high">已逾期 ${Math.abs(days)} 天</span>`;
+  if (days === 0) return `<span class="badge badge-high">今日截止</span>`;
+  if (days <= 3) return `<span class="badge badge-medium">剩 ${days} 天</span>`;
+  return `<span class="badge badge-plan">剩 ${days} 天</span>`;
 }
 
 /* Generic Click-to-Edit Helper */
@@ -1071,23 +1304,26 @@ function startInlineEdit(el, currentVal, multiline, onSave) {
 }
 
 async function loadAll() {
-  const [projects, dailyTasks, feedbacks] = await Promise.all([
+  const [projects, dailyTasks, feedbacks, quadrantData] = await Promise.all([
     api('/api/projects'),
     api('/api/daily-tasks?date=' + encodeURIComponent(state.selectedDate)),
-    api('/api/feedbacks')
+    api('/api/feedbacks'),
+    api('/api/urgent-quadrant')
   ]);
   state.projects = projects;
   state.dailyTasks = dailyTasks;
   state.feedbacks = feedbacks;
+  state.quadrantData = quadrantData;
 
   const openCount = feedbacks.filter(f => f.status === 'open' || f.status === 'in_progress' || f.status === 'planned').length;
   const badge = document.getElementById('fb-open-badge');
-  if (openCount > 0) {
-    badge.textContent = openCount;
-    badge.style.display = 'inline-block';
-  } else {
-    badge.style.display = 'none';
-  }
+  badge.textContent = openCount;
+  badge.style.display = openCount > 0 ? 'inline-block' : 'none';
+
+  const uCnt = quadrantData?.urgent_3d_count || 0;
+  const uBadge = document.getElementById('q-urgent-badge');
+  uBadge.textContent = uCnt;
+  uBadge.style.display = uCnt > 0 ? 'inline-block' : 'none';
 
   if (state.selectedProjectId) {
     try {
@@ -1109,6 +1345,7 @@ function switchTab(tab) {
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   const titles = {
     dashboard: '全部项目总览',
+    quadrant: '紧急与重要四象限工作台',
     projects: '科研项目详情与数据证据',
     daily: '每日工作记录与任务管理',
     feedback: '系统意见与改进记录'
@@ -1120,9 +1357,96 @@ function switchTab(tab) {
 function render() {
   const el = document.getElementById('app-content');
   if (state.tab === 'dashboard') renderDashboard(el);
+  else if (state.tab === 'quadrant') renderQuadrantPage(el);
   else if (state.tab === 'projects') renderProjects(el);
   else if (state.tab === 'daily') renderDaily(el);
   else renderFeedback(el);
+}
+
+function renderQuadrantGridHtml(qData) {
+  if (!qData) return '';
+  const q = qData.quadrants;
+  const renderCard = (it) => `
+    <div class="quad-item" onclick="${it.kind==='step' ? `selectProjectAndGo(${it.project_id})` : `jumpToDailyTask(${it.id})`}">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:6px;">
+        <strong style="font-size:13px;">${esc(it.title)}</strong>
+        ${formatDaysLeft(it.days_left)}
+      </div>
+      <div style="font-size:11.5px; color:var(--muted); margin-top:4px;">
+        ${it.kind==='step' ? '🔬' : '✅'} ${esc(it.project_title)} ${it.due_date ? `· 截止 ${esc(it.due_date)}` : ''}
+      </div>
+      ${it.sub_info ? `<div style="font-size:11.5px; color:#475569; margin-top:3px;">${esc(it.sub_info)}</div>` : ''}
+    </div>`;
+
+  const emptyBox = `<div style="font-size:12px; color:var(--muted); padding:14px 0;">暂无任务</div>`;
+
+  return `
+    <div class="quad-grid">
+      <div class="quad-box quad-q1">
+        <div class="section-title" style="margin-bottom:4px;">
+          <span style="color:#dc2626;">🔥 第一象限：重要且紧急（立即处理）</span>
+          <span class="badge badge-high">${q.q1_urgent_important.length}</span>
+        </div>
+        ${q.q1_urgent_important.length ? q.q1_urgent_important.map(renderCard).join('') : emptyBox}
+      </div>
+      <div class="quad-box quad-q2">
+        <div class="section-title" style="margin-bottom:4px;">
+          <span style="color:#2563eb;">🎯 第二象限：重要不紧急（重点规划）</span>
+          <span class="badge badge-active">${q.q2_not_urgent_important.length}</span>
+        </div>
+        ${q.q2_not_urgent_important.length ? q.q2_not_urgent_important.map(renderCard).join('') : emptyBox}
+      </div>
+      <div class="quad-box quad-q3">
+        <div class="section-title" style="margin-bottom:4px;">
+          <span style="color:#d97706;">⚡ 第三象限：紧急不重要（快速清理）</span>
+          <span class="badge badge-medium">${q.q3_urgent_not_important.length}</span>
+        </div>
+        ${q.q3_urgent_not_important.length ? q.q3_urgent_not_important.map(renderCard).join('') : emptyBox}
+      </div>
+      <div class="quad-box quad-q4">
+        <div class="section-title" style="margin-bottom:4px;">
+          <span style="color:#475569;">🗂️ 第四象限：不重要不紧急（排期延后）</span>
+          <span class="badge badge-plan">${q.q4_neither.length}</span>
+        </div>
+        ${q.q4_neither.length ? q.q4_neither.map(renderCard).join('') : emptyBox}
+      </div>
+    </div>`;
+}
+
+function renderQuadrantPage(el) {
+  const qData = state.quadrantData;
+  const pushed = qData?.pushed_top || [];
+  const pushedHtml = pushed.length ? pushed.map((it, idx) => `
+    <div class="task-item" style="cursor:pointer; margin-bottom:8px;" onclick="${it.kind==='step' ? `selectProjectAndGo(${it.project_id})` : `jumpToDailyTask(${it.id})`}">
+      <strong style="color:var(--primary); min-width:22px;">#${idx+1}</strong>
+      <div style="flex:1;">
+        <div style="font-weight:700; font-size:13.5px;">${esc(it.title)}</div>
+        <div style="font-size:12px; color:var(--muted); margin-top:2px;">
+          ${esc(it.project_title)} ${it.due_date ? `· 截止 ${esc(it.due_date)}` : ''}
+          ${it.sub_info ? ` · ${esc(it.sub_info)}` : ''}
+        </div>
+      </div>
+      <div style="display:flex; gap:6px; align-items:center;">
+        ${formatDaysLeft(it.days_left)}
+        <span class="badge ${(PRIORITY_MAP[it.priority]||PRIORITY_MAP.medium).cls}">${(PRIORITY_MAP[it.priority]||PRIORITY_MAP.medium).label}</span>
+      </div>
+    </div>`).join('') : `<div class="empty-state" style="padding:18px;">暂无紧急或待完成任务 🎉</div>`;
+
+  el.innerHTML = `
+    <div class="card" style="margin-bottom:16px;">
+      <div class="section-title">
+        <span>🚨 最着急的 5 项 / 3 天内必须完成的任务推送（共 ${pushed.length} 项）</span>
+        <span style="font-size:12px; color:var(--muted); font-weight:400;">点击任意条目可直达对应项目或每日任务</span>
+      </div>
+      ${pushedHtml}
+    </div>
+    <div class="card">
+      <div class="section-title">
+        <span>🧭 紧急 × 重要 四象限矩阵</span>
+        <span style="font-size:12px; color:var(--muted); font-weight:400;">横轴：3天内截止为紧急 ｜ 纵轴：高优先级或活跃项目步骤为重要</span>
+      </div>
+      ${renderQuadrantGridHtml(qData)}
+    </div>`;
 }
 
 function renderDashboard(el) {
@@ -1136,8 +1460,24 @@ function renderDashboard(el) {
   let filtered = state.projects;
   if (state.filterStatus !== 'all') filtered = filtered.filter(p => p.status === state.filterStatus);
 
+  // #3 全部项目总览中每个项目只显示最新的未完成工作
   const projectRows = filtered.length ? filtered.map(p => {
     const st = STATUS_MAP[p.status] || STATUS_MAP.active;
+    const lu = p.latest_unfinished;
+    let unfinishedHtml = '';
+    if (lu) {
+      const subText = lu.pending_subtasks && lu.pending_subtasks.length
+        ? `最新未完成分点：${lu.pending_subtasks.map(x => `□ ${esc(x)}`).join(' ｜ ')}${lu.pending_subtask_total > 3 ? `（共 ${lu.pending_subtask_total} 项未完成）` : ''}`
+        : `当前未完成步骤：步骤 ${lu.step_order}. ${esc(lu.step_title)} (${lu.step_progress}%)`;
+      unfinishedHtml = `
+        <div class="unfinished-pill">
+          <strong>⏳ 最新未完成：</strong>步骤 ${lu.step_order}. ${esc(lu.step_title)}
+          ${lu.pending_subtasks && lu.pending_subtasks.length ? `<div style="margin-top:3px;">${subText}</div>` : ''}
+        </div>`;
+    } else if (p.step_count > 0) {
+      unfinishedHtml = `<div style="margin-top:6px; font-size:12px; color:var(--success);">✅ 全部步骤均已完成</div>`;
+    }
+
     return `
       <div style="padding:14px 0; border-bottom:1px solid var(--border); cursor:pointer;" onclick="selectProjectAndGo(${p.id})">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
@@ -1158,25 +1498,35 @@ function renderDashboard(el) {
           <span>数据与证据: ${p.evidence_count} 条</span>
           <span>计划周期: ${esc(p.start_date || '未设')} ~ ${esc(p.target_date || '未设')}</span>
         </div>
+        ${unfinishedHtml}
       </div>`;
   }).join('') : `<div class="empty-state">暂无科研项目，点击右上角「新建科研项目」或左侧「导入示例科研项目」开始使用。</div>`;
 
+  // #4 项目总览中每日工作跳转与分点最新未完成进度展示
   const todayTasksHtml = state.dailyTasks.length ? state.dailyTasks.slice(0, 6).map(t => {
     const subs = t.subtasks || [];
     const subDone = subs.filter(x => x.done).length;
+    const pendingSubs = subs.filter(x => !x.done);
+    const rolledBadge = (t.origin_date && t.origin_date !== t.task_date) ? ` · ↪ 顺延自 ${esc(t.origin_date)}` : '';
     return `
-      <div class="task-item ${t.is_completed?'completed':''}">
-        <input type="checkbox" class="task-check" ${t.is_completed?'checked':''} onchange="toggleTask(${t.id}, this.checked)" />
-        <div style="flex:1;">
+      <div class="task-item ${t.is_completed?'completed':''}" style="cursor:pointer;" onclick="jumpToDailyTask(${t.id})">
+        <input type="checkbox" class="task-check" ${t.is_completed?'checked':''} onclick="event.stopPropagation()" onchange="toggleTask(${t.id}, this.checked)" />
+        <div style="flex:1; min-width:0;">
           <div class="task-title" style="font-size:13.5px; font-weight:600;">${esc(t.title)}</div>
           <div style="font-size:12px; color:var(--muted); margin-top:2px;">
-            ${t.project_title ? '📁 ' + esc(t.project_title) : '📝 日常科研'} · 预计 ${t.estimated_hours}h
-            ${subs.length ? ` · 分点进度 ${subDone}/${subs.length}` : ''}
+            ${t.project_title ? '📁 ' + esc(t.project_title) : '📝 日常科研'} · 预计 ${t.estimated_hours} 小时${rolledBadge}
           </div>
+          ${subs.length ? `
+            <div style="margin-top:5px; font-size:12px; color:#334155;">
+              <div>分点进度：<strong>${subDone}/${subs.length}</strong>${pendingSubs.length ? ` ｜ 最新未完成：□ ${esc(pendingSubs[0].text)}` : ' ｜ 全部完成'}</div>
+            </div>` : ''}
         </div>
         <span class="badge ${(PRIORITY_MAP[t.priority]||PRIORITY_MAP.medium).cls}">${(PRIORITY_MAP[t.priority]||PRIORITY_MAP.medium).label}</span>
       </div>`;
   }).join('') : `<div class="empty-state" style="padding:20px;">今日暂未记录任务，<a href="javascript:void(0)" onclick="switchTab('daily')">去添加每日工作</a></div>`;
+
+  const qData = state.quadrantData;
+  const pushedTop = qData?.pushed_top || [];
 
   el.innerHTML = `
     <div class="grid-4">
@@ -1190,22 +1540,22 @@ function renderDashboard(el) {
         <div class="stat-val" style="color:var(--primary);">${avgProg}%</div>
         <div class="progress-wrap" style="margin-top:8px;"><div class="progress-bar" style="width:${avgProg}%"></div></div>
       </div>
-      <div class="card">
+      <div class="card" style="cursor:pointer;" onclick="switchTab('daily')">
         <div class="stat-label">今日待完成工作</div>
         <div class="stat-val" style="color:var(--warning);">${todayPending}</div>
-        <div class="stat-sub">日期：${esc(state.selectedDate)}</div>
+        <div class="stat-sub">日期：${esc(state.selectedDate)}（点击跳转）</div>
       </div>
-      <div class="card">
+      <div class="card" style="cursor:pointer;" onclick="switchTab('daily')">
         <div class="stat-label">今日已完成工作</div>
         <div class="stat-val" style="color:var(--success);">${todayDone}</div>
         <div class="stat-sub">完成率：${(todayPending+todayDone)?Math.round(todayDone*100/(todayPending+todayDone)):0}%</div>
       </div>
     </div>
 
-    <div class="grid-2" style="grid-template-columns: 1.45fr 1fr;">
+    <div class="grid-2" style="grid-template-columns: 1.45fr 1fr; margin-bottom:18px;">
       <div class="card">
         <div class="section-title">
-          <span>全部项目当前进度</span>
+          <span>全部项目当前进度（含最新未完成分点）</span>
           <select style="width:auto; padding:4px 8px; font-size:12px;" onchange="state.filterStatus=this.value; render();">
             <option value="all" ${state.filterStatus==='all'?'selected':''}>全部状态</option>
             <option value="active" ${state.filterStatus==='active'?'selected':''}>进行中</option>
@@ -1223,7 +1573,27 @@ function renderDashboard(el) {
         </div>
         ${todayTasksHtml}
       </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <span>🎯 紧急与重要四象限模块（最着急 5 项 / 3 天内必完成：${pushedTop.length} 项）</span>
+        <button class="btn btn-sm" onclick="switchTab('quadrant')">展开独立视图 →</button>
+      </div>
+      ${renderQuadrantGridHtml(qData)}
     </div>`;
+}
+
+function jumpToDailyTask(taskId) {
+  state.selectedDate = localTodayStr();
+  state.highlightTaskId = taskId;
+  switchTab('daily');
+  loadAll().then(() => {
+    setTimeout(() => {
+      const el = document.getElementById('daily-task-' + taskId);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 60);
+  });
 }
 
 async function selectProjectAndGo(id) {
@@ -1378,7 +1748,7 @@ function renderProjects(el) {
       <div class="step-card">
         <div class="step-header">
           <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:1;">
-            <span style="font-weight:700; font-size:14.5px;">Step ${s.step_order}.</span>
+            <span style="font-weight:700; font-size:14.5px;">步骤 ${s.step_order}：</span>
             <span class="editable" style="font-weight:700; font-size:14.5px;" title="点击直接编辑步骤名称" onclick="startInlineEdit(this, ${JSON.stringify(s.title)}, false, v => patchStepField(${s.id}, {title: v}))">${esc(s.title)}</span>
             <span class="badge ${sst.cls}">${sst.label}</span>
             ${s.due_date ? `<span style="font-size:12px; color:var(--muted);">截止 ${esc(s.due_date)}</span>` : ''}
@@ -1512,21 +1882,30 @@ function renderDaily(el) {
     const pr = PRIORITY_MAP[t.priority] || PRIORITY_MAP.medium;
     const subs = t.subtasks || [];
     const subDone = subs.filter(x => x.done).length;
+    const rolledBadge = (t.origin_date && t.origin_date !== t.task_date)
+      ? `<span class="badge badge-paused" style="margin-left:6px;">↪ 顺延自 ${esc(t.origin_date)}</span>`
+      : '';
+    const dueBadge = t.due_date ? `<span style="font-size:11.5px; color:var(--muted);"> · 截止 ${esc(t.due_date)}</span>` : '';
+    const isHi = state.highlightTaskId === t.id;
     return `
-      <div class="task-item ${t.is_completed?'completed':''}">
-        <input type="checkbox" class="task-check" ${t.is_completed?'checked':''} onchange="toggleTask(${t.id}, this.checked)" title="${subs.length?'点击将全部设为空/完成':'切换任务完成状态'}" />
+      <div id="daily-task-${t.id}" class="task-item ${t.is_completed?'completed':''} ${isHi?'highlight':''}">
+        <input type="checkbox" class="task-check" ${t.is_completed?'checked':''} onchange="toggleTask(${t.id}, this.checked)" title="${subs.length?'点击将全部设为空或完成':'切换任务完成状态'}" />
         <div style="flex:1; min-width:0;">
-          <div class="task-title editable" style="font-size:14px; font-weight:600;" title="点击直接编辑任务名称" onclick="startInlineEdit(this, ${JSON.stringify(t.title)}, false, v => patchTaskField(${t.id}, {title: v}))">${esc(t.title)}</div>
+          <div style="display:flex; align-items:center; flex-wrap:wrap; gap:4px;">
+            <div class="task-title editable" style="font-size:14px; font-weight:600;" title="点击直接编辑任务名称" onclick="startInlineEdit(this, ${JSON.stringify(t.title)}, false, v => patchTaskField(${t.id}, {title: v}))">${esc(t.title)}</div>
+            ${rolledBadge}
+          </div>
           <div style="font-size:12px; color:var(--muted); margin-top:3px;">
             ${t.project_title ? '📁 ' + esc(t.project_title) : '📝 日常科研'} · 预计
-            <span class="editable" title="点击修改工时" onclick="startInlineEdit(this, ${JSON.stringify(String(t.estimated_hours))}, false, v => patchTaskField(${t.id}, {estimated_hours: Number(v)||1}))">${t.estimated_hours}</span>h
+            <span class="editable" title="点击修改工时" onclick="startInlineEdit(this, ${JSON.stringify(String(t.estimated_hours))}, false, v => patchTaskField(${t.id}, {estimated_hours: Number(v)||1}))">${t.estimated_hours}</span> 小时
+            ${dueBadge}
             ${subs.length ? ` · 分点完成 <strong>${subDone}/${subs.length}</strong>` : ''}
             ${t.completed_at ? ' · 完成于 ' + esc(t.completed_at.slice(11,16)) : ''}
           </div>
-          <div class="editable" style="font-size:12.5px; color:#475569; margin-top:5px; white-space:pre-wrap;" title="点击直接编辑备注" onclick="startInlineEdit(this, ${JSON.stringify(t.notes||'')}, true, v => patchTaskField(${t.id}, {notes: v}))">${esc(t.notes || '点击添加备注 / 产出说明...')}</div>
+          <div class="editable" style="font-size:12.5px; color:#475569; margin-top:5px; white-space:pre-wrap;" title="点击直接编辑备注" onclick="startInlineEdit(this, ${JSON.stringify(t.notes||'')}, true, v => patchTaskField(${t.id}, {notes: v}))">${esc(t.notes || '点击添加备注或产出说明...')}</div>
           <div class="subtasks-box">
             <div style="font-size:11.5px; font-weight:600; color:var(--muted); margin-bottom:3px;">
-              分点确认 ${subs.length ? `(${subDone}/${subs.length}，全部勾选后任务自动完成)` : '(可选，添加分点后需全部完成才算完成)'}
+              分点确认 ${subs.length ? `(${subDone}/${subs.length}，全部勾选后任务自动完成)` : '（可选，添加分点后需全部完成才算完成）'}
             </div>
             ${subs.map((it, idx) => `
               <div class="subtask-row ${it.done?'done':''}">
@@ -1554,15 +1933,15 @@ function renderDaily(el) {
         <div style="display:flex; align-items:center; gap:10px;">
           <strong>工作日期：</strong>
           <input type="date" style="width:auto;" value="${esc(state.selectedDate)}" onchange="changeDailyDate(this.value)" />
-          <button class="btn btn-sm" onclick="changeDailyDate('${new Date().toISOString().slice(0,10)}')">回到今天</button>
+          <button class="btn btn-sm" onclick="changeDailyDate(localTodayStr())">回到今天</button>
+          <span style="font-size:12px; color:var(--muted);">（未完成任务每日自动顺延至今天，直到完成）</span>
         </div>
         <div style="display:flex; gap:8px;">
-          <button class="btn btn-sm" onclick="carryOverTasks()">↪ 顺延昨日未完成任务到当前日期</button>
-          <button class="btn btn-sm" onclick="exportDailyMarkdown()">📋 导出当日工作日报 (MD)</button>
+          <button class="btn btn-sm" onclick="exportDailyMarkdown()">📋 导出当日工作日报</button>
         </div>
       </div>
 
-      <form onsubmit="addDailyTask(event)" style="margin-top:14px; padding-top:14px; border-top:1px solid var(--border); display:grid; grid-template-columns: 2fr 1.2fr 0.7fr 0.6fr auto; gap:10px; align-items:end;">
+      <form onsubmit="addDailyTask(event)" style="margin-top:14px; padding-top:14px; border-top:1px solid var(--border); display:grid; grid-template-columns: 2fr 1.1fr 0.7fr 0.9fr 0.6fr auto; gap:10px; align-items:end;">
         <div>
           <label style="font-size:12px; font-weight:600; display:block; margin-bottom:4px;">今日需完成工作内容 *</label>
           <input type="text" id="new-task-title" required placeholder="例如：完成样地3点云赋色对比脚本测试..." />
@@ -1580,13 +1959,17 @@ function renderDaily(el) {
           </select>
         </div>
         <div>
-          <label style="font-size:12px; font-weight:600; display:block; margin-bottom:4px;">预计(h)</label>
+          <label style="font-size:12px; font-weight:600; display:block; margin-bottom:4px;">截止日期（选填）</label>
+          <input type="date" id="new-task-due" value="${esc(state.selectedDate)}" />
+        </div>
+        <div>
+          <label style="font-size:12px; font-weight:600; display:block; margin-bottom:4px;">预计(小时)</label>
           <input type="number" id="new-task-hours" step="0.5" min="0.5" value="1.5" />
         </div>
         <button type="submit" class="btn btn-primary">＋ 添加任务</button>
         <div style="grid-column: 1 / -1; display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
-          <input type="text" id="new-task-notes" placeholder="补充备注 / 预期产出（选填）" />
-          <input type="text" id="new-task-subs" placeholder="分点确认项（选填，多个分点用英文或中文分号 ; / ； 隔开）" />
+          <input type="text" id="new-task-notes" placeholder="补充备注或预期产出（选填）" />
+          <input type="text" id="new-task-subs" placeholder="分点确认项（选填，多个分点用分号 ； 隔开）" />
         </div>
       </form>
     </div>
@@ -1674,7 +2057,7 @@ function renderFeedback(el) {
         <div class="stat-val">${total}</div>
       </div>
       <div class="card">
-        <div class="stat-label">待处理 (Open)</div>
+        <div class="stat-label">待处理</div>
         <div class="stat-val" style="color:var(--warning);">${openCnt}</div>
       </div>
       <div class="card">
@@ -1682,7 +2065,7 @@ function renderFeedback(el) {
         <div class="stat-val" style="color:var(--primary);">${activeCnt}</div>
       </div>
       <div class="card">
-        <div class="stat-label">已解决 (Resolved)</div>
+        <div class="stat-label">已解决</div>
         <div class="stat-val" style="color:var(--success);">${resolvedCnt}</div>
       </div>
     </div>
@@ -1690,7 +2073,7 @@ function renderFeedback(el) {
     <div class="card" style="margin-bottom:16px;">
       <div class="section-title">
         <span>📝 快速记录使用问题或改进建议</span>
-        <button class="btn btn-sm" onclick="exportFeedbackMarkdown()">📋 导出待处理改进清单 (MD)</button>
+        <button class="btn btn-sm" onclick="exportFeedbackMarkdown()">📋 导出待处理改进清单</button>
       </div>
       <form onsubmit="quickAddFeedback(event)" style="display:grid; grid-template-columns: 2fr 1fr 0.9fr 0.8fr auto; gap:10px; align-items:end;">
         <div>
@@ -1850,7 +2233,7 @@ async function deleteFeedback(id) {
 function exportFeedbackMarkdown() {
   const pending = state.feedbacks.filter(f => f.status !== 'resolved' && f.status !== 'wontfix');
   const lines = [
-    `# 科研项目管理系统 — 待统一处理改进清单 (${new Date().toISOString().slice(0,10)})`,
+    `# 科研项目管理系统 — 待统一处理改进清单 (${localTodayStr()})`,
     '',
     `共 ${pending.length} 项待处理/排期中需求与问题：`,
     ''
@@ -1868,7 +2251,7 @@ function exportFeedbackMarkdown() {
   const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `待处理改进清单_${new Date().toISOString().slice(0,10)}.md`;
+  a.download = `待处理改进清单_${localTodayStr()}.md`;
   a.click();
 }
 
@@ -1971,9 +2354,16 @@ function openStepModal(projectId, stepId = null) {
       </div>
       <div class="form-group"><label>步骤名称 *</label><input type="text" id="s-title" required value="${esc(s?.title||'')}" /></div>
       <div class="grid-2">
-        <div class="form-group"><label>步骤完成度 (进行中时生效 0-100)</label><input type="number" id="s-prog" min="0" max="100" value="${s?.progress ?? 50}" /></div>
+        <div class="form-group"><label>重要性（四象限评估）</label>
+          <select id="s-prio">
+            <option value="high" ${s?.priority==='high'?'selected':''}>高（重要）</option>
+            <option value="medium" ${(!s||s.priority==='medium')?'selected':''}>中</option>
+            <option value="low" ${s?.priority==='low'?'selected':''}>低</option>
+          </select>
+        </div>
         <div class="form-group"><label>计划截止日期</label><input type="date" id="s-due" value="${esc(s?.due_date||'')}" /></div>
       </div>
+      <div class="form-group"><label>步骤完成度 (进行中时生效 0-100)</label><input type="number" id="s-prog" min="0" max="100" value="${s?.progress ?? 50}" /></div>
       <div class="form-group"><label>步骤说明 / 方法</label><textarea id="s-desc">${esc(s?.description||'')}</textarea></div>
       <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px;">
         <button type="button" class="btn" onclick="closeModal()">取消</button>
@@ -1989,6 +2379,7 @@ async function saveStep(e, projectId, stepId) {
     step_order: Number(document.getElementById('s-order').value || 1),
     status: document.getElementById('s-status').value,
     title: document.getElementById('s-title').value.trim(),
+    priority: document.getElementById('s-prio').value,
     progress: Number(document.getElementById('s-prog').value || 0),
     due_date: document.getElementById('s-due').value,
     description: document.getElementById('s-desc').value
@@ -2018,9 +2409,9 @@ function openEvidenceModal(projectId, stepId) {
     <h3 style="margin:0 0 14px;">添加数据与证据</h3>
     <form onsubmit="saveEvidence(event, ${projectId}, ${stepId})">
       <div class="form-group"><label>证据/数据标题 *</label><input type="text" id="ev-title" required placeholder="例如：实验结果对比图 / 样地3点云参数表" /></div>
-      <div class="form-group"><label>上传文件（图片/PDF/CSV/文档，自动归档到本地证据库）</label><input type="file" id="ev-file" /></div>
-      <div class="form-group"><label>或关联 Windows 本地文件/文件夹路径（可一键打开）</label><input type="text" id="ev-local" placeholder="例如：D:\\Research\\Exp01\\metrics.csv" /></div>
-      <div class="form-group"><label>参考链接 URL（论文/代码仓库/在线文档）</label><input type="text" id="ev-url" placeholder="https://..." /></div>
+      <div class="form-group"><label>上传文件（图片/文档/表格，自动归档到本地证据库）</label><input type="file" id="ev-file" /></div>
+      <div class="form-group"><label>或关联本地文件/文件夹路径（可一键打开）</label><input type="text" id="ev-local" placeholder="例如：D:\\Research\\Exp01\\metrics.csv" /></div>
+      <div class="form-group"><label>参考链接（论文/代码仓库/在线文档）</label><input type="text" id="ev-url" placeholder="https://..." /></div>
       <div class="form-group"><label>关键数据指标 / 实验结论摘要</label><textarea id="ev-summary" placeholder="记录关键数值、参数设置、实验现象或支撑结论..."></textarea></div>
       <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px;">
         <button type="button" class="btn" onclick="closeModal()">取消</button>
@@ -2069,7 +2460,7 @@ async function deleteEvidence(id) {
 async function openLocalPath(path) {
   try {
     await api('/api/open-local', 'POST', { path });
-    showToast('已在 Windows 中打开');
+    showToast('已在本地打开');
   } catch (err) {
     alert('打开失败：' + err.message);
   }
@@ -2099,6 +2490,7 @@ async function addDailyTask(e) {
     : [];
   await api('/api/daily-tasks', 'POST', {
     task_date: state.selectedDate,
+    due_date: document.getElementById('new-task-due').value,
     project_id: projVal ? Number(projVal) : null,
     title: document.getElementById('new-task-title').value.trim(),
     priority: document.getElementById('new-task-prio').value,
@@ -2127,12 +2519,6 @@ async function deleteTask(id) {
   await loadAll();
 }
 
-async function carryOverTasks() {
-  const res = await api('/api/daily-tasks/carry-over', 'POST', { target_date: state.selectedDate });
-  showToast(`已顺延 ${res.moved} 条未完成任务`);
-  await loadAll();
-}
-
 function exportDailyMarkdown() {
   const pending = state.dailyTasks.filter(t => !t.is_completed);
   const done = state.dailyTasks.filter(t => t.is_completed);
@@ -2156,7 +2542,7 @@ function exportDailyMarkdown() {
 }
 
 async function seedDemo() {
-  if (!confirm('将导入示例科研项目、今日任务与意见改进记录用于体验，是否继续？')) return;
+  if (!confirm('将导入示例科研项目与今日任务用于体验，是否继续？')) return;
   await api('/api/seed-demo', 'POST', {});
   showToast('示例数据已导入');
   await loadAll();
@@ -2174,7 +2560,7 @@ loadAll();
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "ResearchPM/1.2"
+    server_version = "ResearchPM/1.4"
 
     def log_message(self, format, *args):
         pass
@@ -2209,6 +2595,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(fetch_all_projects_summary())
             return
 
+        if path == "/api/urgent-quadrant":
+            self._send_json(fetch_urgent_quadrant())
+            return
+
         m = re.fullmatch(r"/api/projects/(\d+)", path)
         if m:
             detail = fetch_project_detail(int(m.group(1)))
@@ -2220,8 +2610,12 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/daily-tasks":
             qs = urllib.parse.parse_qs(parsed.query)
-            date_val = qs.get("date", [today_str()])[0]
+            today = today_str()
+            date_val = qs.get("date", [today])[0]
             with get_conn() as conn:
+                if date_val == today:
+                    if auto_rollover_tasks(conn, today) > 0:
+                        conn.commit()
                 rows = conn.execute(
                     """
                     SELECT dt.*, p.title AS project_title
@@ -2351,8 +2745,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             with get_conn() as conn:
                 cur = conn.execute(
                     """
-                    INSERT INTO project_steps (project_id, step_order, title, description, status, progress, due_date, subtasks_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO project_steps (project_id, step_order, title, description, status, progress, due_date, priority, subtasks_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         project_id,
@@ -2362,6 +2756,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         status,
                         prog,
                         data.get("due_date", ""),
+                        data.get("priority", "medium"),
                         json.dumps(subs, ensure_ascii=False),
                         ts,
                     ),
@@ -2385,7 +2780,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if orig_name and b64:
                 proj_dir = EVIDENCE_DIR / f"proj_{project_id}"
                 proj_dir.mkdir(parents=True, exist_ok=True)
-                safe_name = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{sanitize_filename(orig_name)}"
+                safe_name = f"{beijing_now().strftime('%Y%m%d_%H%M%S')}_{sanitize_filename(orig_name)}"
                 dest = proj_dir / safe_name
                 dest.write_bytes(base64.b64decode(b64))
                 file_rel_path = f"proj_{project_id}/{safe_name}"
@@ -2420,17 +2815,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not title:
                 self._send_json({"error": "任务内容不能为空"}, HTTPStatus.BAD_REQUEST)
                 return
+            t_date = data.get("task_date") or today_str()
+            due_date = data.get("due_date") or ""
             subs = parse_subtasks(data.get("subtasks"))
             is_comp = 1 if (subs and all(x["done"] for x in subs)) else 0
             comp_at = ts if is_comp else ""
             with get_conn() as conn:
                 cur = conn.execute(
                     """
-                    INSERT INTO daily_tasks (task_date, project_id, title, priority, estimated_hours, notes, subtasks_json, is_completed, completed_at, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO daily_tasks (task_date, origin_date, due_date, project_id, title, priority, estimated_hours, notes, subtasks_json, is_completed, completed_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        data.get("task_date") or today_str(),
+                        t_date,
+                        t_date,
+                        due_date,
                         data.get("project_id"),
                         title,
                         data.get("priority", "medium"),
@@ -2444,17 +2843,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
                 self._send_json({"id": cur.lastrowid}, HTTPStatus.CREATED)
-            return
-
-        if path == "/api/daily-tasks/carry-over":
-            target_date = data.get("target_date") or today_str()
-            with get_conn() as conn:
-                cur = conn.execute(
-                    "UPDATE daily_tasks SET task_date = ? WHERE is_completed = 0 AND task_date < ?",
-                    (target_date, target_date),
-                )
-                conn.commit()
-                self._send_json({"moved": cur.rowcount})
             return
 
         if path == "/api/feedbacks":
@@ -2573,7 +2961,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 conn.execute(
                     """
                     UPDATE project_steps
-                    SET step_order=?, title=?, description=?, status=?, progress=?, due_date=?, subtasks_json=?
+                    SET step_order=?, title=?, description=?, status=?, progress=?, due_date=?, priority=?, subtasks_json=?
                     WHERE id=?
                     """,
                     (
@@ -2583,6 +2971,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         new_status,
                         new_prog,
                         data.get("due_date", row["due_date"]),
+                        data.get("priority", row["priority"] or "medium"),
                         subs_json,
                         sid,
                     ),
@@ -2637,12 +3026,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 conn.execute(
                     """
                     UPDATE daily_tasks
-                    SET title=?, priority=?, estimated_hours=?, notes=?, subtasks_json=?, is_completed=?, completed_at=?
+                    SET title=?, priority=?, due_date=?, estimated_hours=?, notes=?, subtasks_json=?, is_completed=?, completed_at=?
                     WHERE id=?
                     """,
                     (
                         data.get("title", row["title"]),
                         data.get("priority", row["priority"]),
+                        data.get("due_date", row["due_date"] or ""),
                         float(data.get("estimated_hours", row["estimated_hours"]) or 1.0),
                         data.get("notes", row["notes"]),
                         subs_json,
